@@ -1,0 +1,11 @@
+# CODEOWNERS for .github
+#
+# Declares review responsibility for changes to this repository. Any change to a
+# path matched below requires approval from the listed owner(s) before merge.
+#
+# Format: <path-pattern>  <owner> [<owner>...]
+# Wildcards: * matches one segment, ** matches multiple segments.
+# Order matters: the LAST matching pattern wins.
+
+# Default: the Platform team reviews all changes.
+*                       @verifast-org/platform
