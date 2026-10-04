@@ -1,0 +1,13 @@
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "description": "Renovate preset for this organization's repositories: the shared coding standards, with this organization's reusable workflows kept on their version tags",
+    "extends": ["github>sinemacula/coding-standards"],
+    "packageRules": [
+        {
+            "description": "This organization's reusable workflows stay on their version tags, like GitHub's and Sine Macula's",
+            "matchManagers": ["github-actions"],
+            "matchPackageNames": ["verifast-org/**"],
+            "pinDigests": false
+        }
+    ]
+}
