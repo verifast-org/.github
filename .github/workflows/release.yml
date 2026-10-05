@@ -32,7 +32,7 @@
 #     release tag can TRIGGER downstream workflows (required when the tag fires
 #     an artifact/deploy pipeline). It also bypasses the GITHUB_TOKEN
 #     PR-creation restriction. The org must expose these secrets and the caller
-#     must forward them with `secrets: inherit`:
+#     must forward them explicitly under `secrets:`:
 #       RELEASE_APP_CLIENT_ID    — GitHub App Client ID
 #       RELEASE_APP_PRIVATE_KEY  — GitHub App private key (PEM)
 # ==============================================================================
@@ -69,6 +69,13 @@ on:
                 type: boolean
                 required: false
                 default: false
+        secrets:
+            RELEASE_APP_CLIENT_ID:
+                description: GitHub App Client ID, required when use-app-token is true
+                required: false
+            RELEASE_APP_PRIVATE_KEY:
+                description: GitHub App private key (PEM), required when use-app-token is true
+                required: false
 
 # ==============================================================================
 # PERMISSIONS
@@ -106,14 +113,15 @@ jobs:
             -   name: Mint app token
                 id: app-token
                 if: ${{ inputs.use-app-token }}
-                uses: actions/create-github-app-token@v3
+                uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
                 with:
                     client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
                     private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-                    owner: ${{ github.repository_owner }}
+                    permission-contents: write
+                    permission-pull-requests: write
 
             -   name: Release Please
-                uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+                uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
                 with:
                     token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
                     release-type: ${{ inputs.release-type }}
