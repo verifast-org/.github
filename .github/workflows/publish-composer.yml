@@ -1,0 +1,237 @@
+# ==============================================================================
+# REUSABLE WORKFLOW: Publish Composer
+# ==============================================================================
+# Publishes a Composer package to our JFrog registry when a version is tagged.
+# Composer has no `publish` command, so the package is archived with
+# `composer archive` and uploaded to the local Composer repository under the
+# tag's version. Consumers install it through the `verifast-composer` virtual
+# repository.
+#
+# Behaviour:
+#   - Runs for a version tag (`v1.2.3`, `1.2.3`, `v0.4.3-alpha.1`, …). Any other
+#     ref, or a `dev-*` tag, is skipped without failing.
+#   - Never overwrites: if the version already exists in JFrog the run succeeds
+#     without uploading, so re-runs and duplicate triggers are harmless. To fix
+#     a release, tag a new version.
+#   - Records the commit and repository on the artifact (`vcs.revision`,
+#     `vcs.url`), because the dist reference in a consumer's composer.lock is
+#     the archive checksum, not the commit.
+#
+# Auth:
+#   - No stored secret. The job exchanges its GitHub OIDC token for a
+#     short-lived JFrog access token through the JFrog OIDC integration named
+#     by `oidc-provider`. JFrog trusts the CALLER repository's organization, so
+#     the caller must grant `id-token: write`.
+#
+# Caller (one per package repository, e.g. .github/workflows/publish.yml):
+#
+#   on:
+#       push:
+#           tags: [ '*' ]
+#       release:
+#           types: [ published ]
+#
+#   permissions:
+#       contents: read
+#       id-token: write
+#
+#   jobs:
+#       publish:
+#           uses: verifast-org/.github/.github/workflows/publish-composer.yml@<tag>
+#
+#   The `release` trigger matters: tags created with the default GITHUB_TOKEN
+#   (e.g. by release-please without an app token) do not fire `push` events.
+#   When both fire, the second run finds the version already published.
+#
+# Inputs:
+#   - jfrog-url       JFrog platform URL (default https://trial53tney.jfrog.io).
+#   - repository      Local Composer repository to upload to
+#                     (default verifast-composer-local).
+#   - oidc-provider   JFrog OIDC integration name (default github-rentify-admin).
+#   - oidc-audience   Audience that integration expects (default jfrog-github).
+#   - php-version     PHP used to run `composer archive` (default 8.3).
+# ==============================================================================
+name: Publish Composer
+
+# ==============================================================================
+# TRIGGER
+# ==============================================================================
+on:
+    workflow_call:
+        inputs:
+            jfrog-url:
+                description: JFrog platform URL
+                type: string
+                required: false
+                default: https://trial53tney.jfrog.io
+            repository:
+                description: Local Composer repository in JFrog to upload to
+                type: string
+                required: false
+                default: verifast-composer-local
+            oidc-provider:
+                description: Name of the JFrog OIDC integration that trusts the caller's organization
+                type: string
+                required: false
+                default: github-rentify-admin
+            oidc-audience:
+                description: Audience the JFrog OIDC integration expects
+                type: string
+                required: false
+                default: jfrog-github
+            php-version:
+                description: PHP version used to run composer archive
+                type: string
+                required: false
+                default: '8.3'
+
+# ==============================================================================
+# PERMISSIONS
+# ==============================================================================
+permissions:
+    contents: read
+    id-token: write
+
+# ==============================================================================
+# CONCURRENCY
+# ==============================================================================
+# One publish per version at a time, so the tag and release triggers can't race
+# on the same upload. Never cancel: a run may be mid-upload.
+concurrency:
+    group: publish-composer-${{ github.repository }}-${{ github.event.release.tag_name || github.ref_name }}
+    cancel-in-progress: false
+
+# ==============================================================================
+# DEFAULTS
+# ==============================================================================
+defaults:
+    run:
+        shell: bash
+
+jobs:
+
+    # ==========================================================================
+    # JOB: PUBLISH
+    # ==========================================================================
+    publish:
+        name: Publish to JFrog
+        runs-on: ubuntu-latest
+
+        steps:
+            -   name: Resolve version
+                id: version
+                env:
+                    TAG: ${{ github.event.release.tag_name || (github.ref_type == 'tag' && github.ref_name) || '' }}
+                run: |
+                    if [ -z "$TAG" ]; then
+                        echo "::notice::Not a tag; nothing to publish"
+                        echo "publish=false" >> "$GITHUB_OUTPUT"
+                    elif [[ "$TAG" == dev-* ]]; then
+                        echo "::notice::Branch-style tag $TAG is not a release; nothing to publish"
+                        echo "publish=false" >> "$GITHUB_OUTPUT"
+                    elif [[ ! "$TAG" =~ ^v?[0-9]+(\.[0-9]+)*([-.+][0-9A-Za-z.+-]+)?$ ]]; then
+                        echo "::notice::Tag $TAG does not look like a version; nothing to publish"
+                        echo "publish=false" >> "$GITHUB_OUTPUT"
+                    else
+                        echo "version=$TAG" >> "$GITHUB_OUTPUT"
+                        echo "publish=true" >> "$GITHUB_OUTPUT"
+                    fi
+
+            -   name: Checkout
+                if: ${{ steps.version.outputs.publish == 'true' }}
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    ref: refs/tags/${{ steps.version.outputs.version }}
+                    persist-credentials: false
+
+            -   name: Setup PHP
+                if: ${{ steps.version.outputs.publish == 'true' }}
+                uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+                with:
+                    php-version: ${{ inputs.php-version }}
+                    coverage: none
+                    tools: composer
+
+            -   name: Exchange GitHub OIDC token for a JFrog access token
+                if: ${{ steps.version.outputs.publish == 'true' }}
+                env:
+                    JFROG_URL: ${{ inputs.jfrog-url }}
+                    OIDC_PROVIDER: ${{ inputs.oidc-provider }}
+                    OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+                run: |
+                    set -euo pipefail
+
+                    id_token=$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                        "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" | jq -r '.value')
+
+                    response=$(jq -n --arg token "$id_token" --arg provider "$OIDC_PROVIDER" '{
+                            grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+                            subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+                            subject_token: $token,
+                            provider_name: $provider
+                        }' \
+                        | curl -sS -X POST -H 'Content-Type: application/json' -d @- \
+                            "${JFROG_URL}/access/api/v1/oidc/token")
+
+                    access_token=$(jq -r '.access_token // empty' <<< "$response")
+                    if [ -z "$access_token" ]; then
+                        echo "::error::JFrog did not return an access token: $(jq -c '.errors // .' <<< "$response")"
+                        exit 1
+                    fi
+
+                    echo "::add-mask::${access_token}"
+                    echo "JFROG_TOKEN=${access_token}" >> "$GITHUB_ENV"
+
+            -   name: Publish
+                if: ${{ steps.version.outputs.publish == 'true' }}
+                env:
+                    JFROG_URL: ${{ inputs.jfrog-url }}
+                    JFROG_REPO: ${{ inputs.repository }}
+                    VERSION: ${{ steps.version.outputs.version }}
+                    VCS_URL: ${{ github.server_url }}/${{ github.repository }}
+                run: |
+                    set -euo pipefail
+
+                    name=$(jq -r '.name // empty' composer.json)
+                    if [ -z "$name" ]; then
+                        echo "::error::composer.json has no name"
+                        exit 1
+                    fi
+
+                    declared=$(jq -r '.version // empty' composer.json)
+                    if [ -n "$declared" ] && [ "${declared#v}" != "${VERSION#v}" ]; then
+                        echo "::error::composer.json declares version $declared but the tag is $VERSION"
+                        exit 1
+                    fi
+
+                    revision=$(git rev-parse HEAD)
+                    file="${name#*/}-${VERSION}.zip"
+                    path="${name}/${file}"
+                    target="${JFROG_URL}/artifactory/${JFROG_REPO}/${path}"
+                    auth=(-H "Authorization: Bearer ${JFROG_TOKEN}")
+
+                    status=$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -I "$target")
+                    if [ "$status" = 200 ]; then
+                        echo "::notice::${name} ${VERSION} is already in ${JFROG_REPO}; nothing to do"
+                        echo "Skipped \`${name}\` \`${VERSION}\`: already in \`${JFROG_REPO}\`." >> "$GITHUB_STEP_SUMMARY"
+                        exit 0
+                    fi
+                    if [ "$status" != 404 ]; then
+                        echo "::error::Unexpected HTTP ${status} checking ${JFROG_REPO}/${path}"
+                        exit 1
+                    fi
+
+                    out=$(mktemp -d)
+                    composer archive --format=zip --dir="$out" --file="${file%.zip}" --no-interaction
+
+                    matrix=";composer.version=${VERSION};vcs.revision=${revision};vcs.url=${VCS_URL}"
+                    code=$(curl -s -o "$out/response" -w '%{http_code}' "${auth[@]}" \
+                        -H "X-Checksum-Sha1: $(sha1sum "$out/$file" | cut -d' ' -f1)" \
+                        -H "X-Checksum-Sha256: $(sha256sum "$out/$file" | cut -d' ' -f1)" \
+                        -T "$out/$file" "${target}${matrix}")
+                    if [ "$code" != 201 ]; then
+                        echo "::error::Upload of ${name} ${VERSION} failed with HTTP ${code}: $(cat "$out/response")"
+                        exit 1
+                    fi
+
+                    echo "Published \`${name}\` \`${VERSION}\` (\`${revision:0:8}\`) to \`${JFROG_REPO}\`." >> "$GITHUB_STEP_SUMMARY"
